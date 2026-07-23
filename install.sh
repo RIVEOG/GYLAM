@@ -25,6 +25,9 @@ PANEL_DIR="${PANEL_DIR:-/opt/gylam-panel}"
 NODE_DIR="${NODE_DIR:-/opt/gylam-node}"
 REPO_URL="${REPO_URL:-https://github.com/your-org/gylam-panel.git}"
 
+# Directory this script lives in — the panel source files sit next to it.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 log()  { echo -e "${GREEN}[gylam]${RESET} $1"; }
 warn() { echo -e "${YELLOW}[gylam]${RESET} $1"; }
 err()  { echo -e "${RED}[gylam]${RESET} $1" >&2; }
@@ -103,13 +106,12 @@ install_deps() {
     apt-get update -y -qq 2>/dev/null || true
   fi
   ensure_pkg curl curl
-  ensure_pkg git git
   ensure_pkg ca-certificates ca-certificates
+  # git is optional now — only needed for update-panel / remote clone fallback
+  ensure_pkg git git
 }
 
 # ── Check + install Node.js and npm ────────────────────────────────
-# If npm is not found, we install Node.js 20 LTS (which bundles npm).
-# We also check Node version is >= 20.
 ensure_node_and_npm() {
   local need_install=false
 
@@ -144,7 +146,6 @@ ensure_node_and_npm() {
     fi
   fi
 
-  # Verify both are now available
   if ! command -v node >/dev/null 2>&1; then
     err "Node.js installation failed. Please install it manually."
     exit 1
@@ -154,6 +155,74 @@ ensure_node_and_npm() {
     exit 1
   fi
   log "Node.js $(node -v) and npm $(npm -v) are ready."
+}
+
+# ── Copy panel source from the directory this script lives in ──────
+# This avoids relying on git clone (which can fail on some VPS images
+# with broken git remote helpers / Rust-based git wrappers).
+copy_panel_source() {
+  local dest="$1"
+
+  # The panel source is the folder containing install.sh.
+  local src="${SCRIPT_DIR}"
+
+  # Sanity check: does the source actually contain the panel files?
+  if [[ ! -f "${src}/package.json" ]] || [[ ! -d "${src}/server" ]]; then
+    warn "Panel source files not found next to install.sh (${src})."
+    warn "Falling back to git clone from ${REPO_URL}..."
+    git_clone_fallback "${dest}"
+    return $?
+  fi
+
+  log "Copying panel files from ${src} to ${dest}..."
+  mkdir -p "$(dirname "${dest}")"
+
+  # rsync if available (fast, excludes junk), otherwise cp -a
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a \
+      --exclude='node_modules' \
+      --exclude='dist' \
+      --exclude='.git' \
+      --exclude='*.log' \
+      "${src}/" "${dest}/"
+  else
+    cp -a "${src}/." "${dest}/"
+    # Clean up junk that cp can't exclude
+    rm -rf "${dest}/node_modules" "${dest}/dist" "${dest}/.git" 2>/dev/null || true
+  fi
+
+  log "Panel files copied."
+  return 0
+}
+
+# ── Fallback: try git clone (with error handling for broken git) ───
+git_clone_fallback() {
+  local dest="$1"
+
+  if ! command -v git >/dev/null 2>&1; then
+    err "git is not installed and no local panel source was found."
+    err "Please place the panel files next to install.sh and re-run."
+    exit 1
+  fi
+
+  log "Attempting git clone of ${REPO_URL}..."
+  if git clone "${REPO_URL}" "${dest}" 2>&1; then
+    log "Clone succeeded."
+    return 0
+  fi
+
+  # git clone failed — could be the broken Rust git helper panic,
+  # a non-existent repo, or network issues.
+  err "git clone failed."
+  err ""
+  err "Common causes:"
+  err "  • The repository URL is a placeholder and doesn't exist yet."
+  err "  • A broken git remote helper (Rust panic) on this VPS image."
+  err ""
+  err "Fix: place the panel source files (package.json, server/, src/, etc.)"
+  err "     in the same folder as install.sh, then re-run."
+  err "     The installer will copy them locally instead of cloning."
+  exit 1
 }
 
 # ====================================================================
@@ -176,19 +245,16 @@ install_panel() {
   log "=== Installing Gylam Panel ==="
   fix_dpkg
   install_deps
-
-  # ── Check + install Node.js and npm ──
   ensure_node_and_npm
 
-  # ── Clone or update ──
-  if [[ -d "${PANEL_DIR}/.git" ]]; then
-    log "Repository exists at ${PANEL_DIR}, pulling latest..."
-    git -C "${PANEL_DIR}" fetch --all
-    git -C "${PANEL_DIR}" pull --ff-only || true
+  # ── Get the panel source onto disk ──
+  # First try copying from the local directory (robust, no git needed).
+  # Falls back to git clone only if local files are missing.
+  if [[ -d "${PANEL_DIR}" && -f "${PANEL_DIR}/package.json" ]]; then
+    log "Panel already exists at ${PANEL_DIR} — updating in place."
+    copy_panel_source "${PANEL_DIR}"
   else
-    log "Cloning Gylam Panel into ${PANEL_DIR}..."
-    mkdir -p "$(dirname "${PANEL_DIR}")"
-    git clone "${REPO_URL}" "${PANEL_DIR}"
+    copy_panel_source "${PANEL_DIR}"
   fi
 
   # ── npm install ──
@@ -489,15 +555,15 @@ UNIT
 # ====================================================================
 update_panel() {
   log "=== Updating Gylam Panel ==="
-  if [[ ! -d "${PANEL_DIR}/.git" ]]; then
+  if [[ ! -d "${PANEL_DIR}" ]]; then
     err "Panel not found at ${PANEL_DIR}. Run 'install-panel' first."
     exit 1
   fi
   ensure_node_and_npm
 
-  log "Pulling latest code..."
-  git -C "${PANEL_DIR}" fetch --all
-  git -C "${PANEL_DIR}" pull --ff-only
+  # Re-copy from local source (same robust approach as install)
+  log "Updating panel files from ${SCRIPT_DIR}..."
+  copy_panel_source "${PANEL_DIR}"
 
   log "Installing dependencies..."
   if [[ -f "${PANEL_DIR}/package-lock.json" ]]; then
@@ -618,12 +684,7 @@ console.log('[gylam] Admin account created successfully.');
 }
 
 # ====================================================================
-# DELETE PANEL  — completely remove everything
-# 1. Stop + disable systemd services (panel + API + node)
-# 2. Remove service unit files
-# 3. Kill any lingering processes
-# 4. Remove panel + node directories
-# 5. Remove log files
+# DELETE PANEL
 # ====================================================================
 delete_panel() {
   echo ""
@@ -661,7 +722,6 @@ delete_panel() {
   echo ""
   log "=== Deleting Gylam Panel ==="
 
-  # ── Step 1: Stop + disable systemd services ──
   log "Stopping systemd services..."
   for svc in gylam-panel-dev gylam-api gylam-node; do
     if systemctl list-unit-files 2>/dev/null | grep -q "${svc}"; then
@@ -671,7 +731,6 @@ delete_panel() {
     fi
   done
 
-  # ── Step 2: Remove service unit files ──
   log "Removing systemd unit files..."
   for unit in \
     /etc/systemd/system/gylam-api.service \
@@ -684,7 +743,6 @@ delete_panel() {
   done
   systemctl daemon-reload 2>/dev/null || true
 
-  # ── Step 3: Kill any lingering processes ──
   log "Killing any lingering Gylam processes..."
   pkill -f "gylam" 2>/dev/null || true
   pkill -f "server/index.js" 2>/dev/null || true
@@ -694,7 +752,6 @@ delete_panel() {
     fuser -k 8080/tcp 2>/dev/null || true
   fi
 
-  # ── Step 4: Remove directories ──
   log "Removing panel directory..."
   if [[ -d "${PANEL_DIR}" ]]; then
     rm -rf "${PANEL_DIR}"
@@ -711,7 +768,6 @@ delete_panel() {
     warn "Node directory not found at ${NODE_DIR}"
   fi
 
-  # ── Step 5: Remove log files ──
   log "Removing log files..."
   rm -f /var/log/gylam-api.log 2>/dev/null && log "Removed /var/log/gylam-api.log" || true
   rm -f /var/log/gylam-panel.log 2>/dev/null || true
