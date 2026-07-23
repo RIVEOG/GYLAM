@@ -22,7 +22,7 @@ RESET="\033[0m"
 
 PANEL_DIR="${PANEL_DIR:-/opt/gylam-panel}"
 NODE_DIR="${NODE_DIR:-/opt/gylam-node}"
-REPO_URL="${REPO_URL:-https://github.com/your-org/gylam-panel.git}"
+REPO_URL="${REPO_URL:-https://github.com/RIVEOG/GYLAM.git}"
 
 log()  { echo -e "${GREEN}[gylam]${RESET} $1"; }
 warn() { echo -e "${YELLOW}[gylam]${RESET} $1"; }
