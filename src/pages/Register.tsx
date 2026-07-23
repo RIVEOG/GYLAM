@@ -18,7 +18,8 @@ export function Register() {
     if (password !== confirm) { setError('Passwords do not match'); return; }
     setLoading(true);
     try { await register(username, email, password); navigate('/'); }
-    catch (err: any) { setError(err.message); } finally { setLoading(false); }
+    catch (err: unknown) { setError(err instanceof Error ? err.message : 'Registration failed'); }
+    finally { setLoading(false); }
   };
 
   return (
