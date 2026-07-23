@@ -23,7 +23,7 @@ RESET="\033[0m"
 
 PANEL_DIR="${PANEL_DIR:-/opt/gylam-panel}"
 NODE_DIR="${NODE_DIR:-/opt/gylam-node}"
-REPO_URL="${REPO_URL:-https://github.com/your-org/gylam-panel.git}"
+REPO_URL="${REPO_URL:-https://github.com/RIVEOG/GYLAM.git}"
 
 # Directory this script lives in — the panel source files sit next to it.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
