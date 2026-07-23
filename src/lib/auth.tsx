@@ -17,33 +17,19 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     const token = localStorage.getItem('gylam_token');
-    if (!token) {
-      setLoading(false);
-      return;
-    }
-    api
-      .me()
-      .then(({ user }) => setUser(user))
-      .catch(() => localStorage.removeItem('gylam_token'))
-      .finally(() => setLoading(false));
+    if (!token) { setLoading(false); return; }
+    api.me().then(({ user }) => setUser(user)).catch(() => localStorage.removeItem('gylam_token')).finally(() => setLoading(false));
   }, []);
 
   const login = async (email: string, password: string) => {
     const { user, token } = await api.login(email, password);
-    localStorage.setItem('gylam_token', token);
-    setUser(user);
+    localStorage.setItem('gylam_token', token); setUser(user);
   };
-
   const register = async (username: string, email: string, password: string) => {
     const { user, token } = await api.register(username, email, password);
-    localStorage.setItem('gylam_token', token);
-    setUser(user);
+    localStorage.setItem('gylam_token', token); setUser(user);
   };
-
-  const logout = () => {
-    localStorage.removeItem('gylam_token');
-    setUser(null);
-  };
+  const logout = () => { localStorage.removeItem('gylam_token'); setUser(null); };
 
   return <Ctx.Provider value={{ user, loading, login, register, logout }}>{children}</Ctx.Provider>;
 }

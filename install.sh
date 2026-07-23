@@ -61,9 +61,6 @@ prompt() {
 }
 
 # ── Fix dpkg cross-device link errors ──────────────────────────────
-# On some VPS/container setups dpkg cannot create backup hard-links
-# across filesystem boundaries ("Invalid cross-device link"). This
-# repairs any interrupted dpkg state and pre-empts the error.
 fix_dpkg() {
   export DEBIAN_FRONTEND=noninteractive
   dpkg --configure -a 2>/dev/null || true
@@ -71,8 +68,6 @@ fix_dpkg() {
 }
 
 # ── Install a single package only if the command is missing ────────
-# This avoids the cross-device link error for packages already present
-# (dpkg only fails on UPGRADES in that scenario).
 ensure_pkg() {
   local cmd="$1" pkg="$2"
   if command -v "$cmd" >/dev/null 2>&1; then
@@ -111,26 +106,53 @@ install_deps() {
   ensure_pkg ca-certificates ca-certificates
 }
 
-install_nodejs() {
-  if command -v node >/dev/null 2>&1 && [[ "$(node -v | cut -d. -f1 | tr -d v)" -ge 20 ]]; then
-    log "Node.js $(node -v) already installed."
-    return 0
+# ── Check + install Node.js and npm ────────────────────────────────
+# If npm is not found, we install Node.js 20 LTS (which bundles npm).
+# We also check Node version is >= 20.
+ensure_node_and_npm() {
+  local need_install=false
+
+  if ! command -v node >/dev/null 2>&1; then
+    need_install=true
+    warn "Node.js is not installed."
+  elif [[ "$(node -v | cut -d. -f1 | tr -d v)" -lt 20 ]]; then
+    need_install=true
+    warn "Node.js version is too old ($(node -v)). Need v20+."
   fi
-  log "Installing Node.js 20 LTS via NodeSource..."
-  if command -v apt-get >/dev/null 2>&1; then
-    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-    apt-get install -y --no-install-recommends \
-      -o Dpkg::Options::="--force-overwrite" \
-      -o Dpkg::Options::="--force-confdef" \
-      -o Dpkg::Options::="--force-confold" \
-      nodejs 2>/dev/null || {
-      warn "Standard install failed, retrying with --force-all..."
-      apt-get install -y -o Dpkg::Options::="--force-all" nodejs
-    }
-  else
-    err "Please install Node.js 20+ manually and re-run."
+
+  if ! command -v npm >/dev/null 2>&1; then
+    need_install=true
+    warn "npm is not installed."
+  fi
+
+  if [[ "$need_install" == "true" ]]; then
+    log "Installing Node.js 20 LTS (includes npm) via NodeSource..."
+    if command -v apt-get >/dev/null 2>&1; then
+      curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+      apt-get install -y --no-install-recommends \
+        -o Dpkg::Options::="--force-overwrite" \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" \
+        nodejs 2>/dev/null || {
+        warn "Standard install failed, retrying with --force-all..."
+        apt-get install -y -o Dpkg::Options::="--force-all" nodejs
+      }
+    else
+      err "Please install Node.js 20+ (with npm) manually and re-run."
+      exit 1
+    fi
+  fi
+
+  # Verify both are now available
+  if ! command -v node >/dev/null 2>&1; then
+    err "Node.js installation failed. Please install it manually."
     exit 1
   fi
+  if ! command -v npm >/dev/null 2>&1; then
+    err "npm installation failed. Please install it manually."
+    exit 1
+  fi
+  log "Node.js $(node -v) and npm $(npm -v) are ready."
 }
 
 # ====================================================================
@@ -146,13 +168,22 @@ show_menu() {
 }
 
 # ====================================================================
-# INSTALL PANEL  — clone, npm install, npm build, systemd
+# INSTALL PANEL
+# 1. Install dependencies (curl, git, ca-certificates)
+# 2. Check for npm — if missing, install Node.js 20 LTS (bundles npm)
+# 3. Clone the repo
+# 4. npm install
+# 5. npm run dev  (starts the panel in dev mode on port 8080)
+# 6. Configure .env
+# 7. Set up systemd services
 # ====================================================================
 install_panel() {
   log "=== Installing Gylam Panel ==="
   fix_dpkg
   install_deps
-  install_nodejs
+
+  # ── Check + install Node.js and npm ──
+  ensure_node_and_npm
 
   # ── Clone or update ──
   if [[ -d "${PANEL_DIR}/.git" ]]; then
@@ -183,12 +214,11 @@ install_panel() {
       cp "${PANEL_DIR}/.env.example" "${env_file}"
     else
       cat > "${env_file}" <<ENVMIN
-VITE_SUPABASE_URL=
-VITE_SUPABASE_ANON_KEY=
 VITE_PANEL_NAME=Gylam Panel
 API_PORT=3001
 JWT_SECRET=change-this-secret
 ADMIN_BOOTSTRAP_SECRET=gylam-bootstrap
+VITE_API_BASE=/api
 ENVMIN
     fi
     echo ""
@@ -208,30 +238,62 @@ ENVMIN
     log "Created data/users.json"
   fi
 
-  # ── npm build ──
-  log "Building production bundle..."
-  npm --prefix "${PANEL_DIR}" run build
+  # ── Start the API server (background) ──
+  log "Starting API server on port 3001..."
+  cd "${PANEL_DIR}"
+  # Kill any existing API process on port 3001
+  if command -v fuser >/dev/null 2>&1; then
+    fuser -k 3001/tcp 2>/dev/null || true
+  fi
+  nohup node server/index.js > /var/log/gylam-api.log 2>&1 &
+  local api_pid=$!
+  log "API server started (PID ${api_pid})."
 
-  # ── systemd services (API + web) ──
+  # ── npm run dev — starts the Vite dev server on port 8080 ──
+  echo ""
+  log "Starting the panel in dev mode (npm run dev)..."
+  log "The panel will be available on port 8080."
+  echo ""
+
+  # Install systemd services so it survives reboots
   install_panel_service
 
+  # Start via systemd if available, otherwise run npm run dev directly
+  if systemctl is-system-running >/dev/null 2>&1; then
+    log "Starting services via systemd..."
+    systemctl daemon-reload
+    systemctl enable gylam-api gylam-panel-dev 2>/dev/null || true
+    systemctl restart gylam-api 2>/dev/null || true
+    systemctl restart gylam-panel-dev 2>/dev/null || true
+    log "Services started via systemd."
+  else
+    warn "systemd not available — panel is running in the background."
+    warn "To start manually: cd ${PANEL_DIR} && npm run dev"
+  fi
+
   echo ""
-  log "Panel installed successfully!"
+  log "Panel installed and running!"
   echo ""
   local server_ip
   server_ip="$(hostname -I 2>/dev/null | awk '{print $1}' || echo 'server-ip')"
+  echo -e "  ${BOLD}Access your panel:${RESET}"
+  echo -e "   ${CYAN}http://${server_ip}:8080${RESET}"
+  echo ""
   echo -e "  ${BOLD}Next steps:${RESET}"
-  echo -e "   1. Edit  ${CYAN}${env_file}${RESET}  with your config"
-  echo -e "   2. Start:  ${CYAN}systemctl start gylam-panel gylam-api${RESET}"
-  echo -e "   3. Open:   ${CYAN}http://${server_ip}:8080${RESET}"
-  echo -e "   4. Create your admin:  ${CYAN}bash install.sh create-admin${RESET}"
+  echo -e "   1. Open the URL above in your browser"
+  echo -e "   2. Create your admin account:  ${CYAN}bash install.sh create-admin${RESET}"
+  echo ""
+  echo -e "  ${BOLD}Manage services:${RESET}"
+  echo -e "   • Restart panel:  ${CYAN}systemctl restart gylam-panel-dev${RESET}"
+  echo -e "   • Restart API:    ${CYAN}systemctl restart gylam-api${RESET}"
+  echo -e "   • View logs:      ${CYAN}journalctl -u gylam-panel-dev -f${RESET}"
   echo ""
 }
 
 configure_env() {
   local env_file="$1"
   echo ""
-  prompt JWT_SECRET_INPUT "JWT Secret (for session tokens)" "gylam-$(head -c 8 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9')"
+  prompt JWT_SECRET_INPUT "JWT Secret (for session tokens — just press Enter to use the auto-generated one)" "gylam-$(head -c 8 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9')"
   prompt API_PORT_INPUT "API Port" "3001"
 
   sed -i \
@@ -245,7 +307,7 @@ configure_env() {
 install_panel_service() {
   log "Installing systemd services..."
 
-  # API server
+  # API server (backend on port 3001)
   cat > /etc/systemd/system/gylam-api.service <<UNIT
 [Unit]
 Description=Gylam Panel API Server
@@ -264,27 +326,25 @@ Environment=NODE_ENV=production
 WantedBy=multi-user.target
 UNIT
 
-  # Web frontend (vite preview)
-  cat > /etc/systemd/system/gylam-panel.service <<UNIT
+  # Web frontend — uses npm run dev (Vite dev server on port 8080)
+  cat > /etc/systemd/system/gylam-panel-dev.service <<UNIT
 [Unit]
-Description=Gylam Panel Web Frontend
+Description=Gylam Panel Web Frontend (dev mode)
 After=network.target gylam-api.service
 
 [Service]
 Type=simple
 WorkingDirectory=${PANEL_DIR}
-ExecStart=$(command -v npx) vite preview --host 0.0.0.0 --port 8080
+ExecStart=$(command -v npm) run dev
 Restart=on-failure
 RestartSec=5
-Environment=NODE_ENV=production
+Environment=NODE_ENV=development
 
 [Install]
 WantedBy=multi-user.target
 UNIT
 
   systemctl daemon-reload
-  systemctl enable gylam-api gylam-panel 2>/dev/null || true
-  warn "Services installed. Start with: systemctl start gylam-api gylam-panel"
 }
 
 # ====================================================================
@@ -294,7 +354,7 @@ install_node() {
   log "=== Installing Gylam Node Agent ==="
   fix_dpkg
   install_deps
-  install_nodejs
+  ensure_node_and_npm
 
   echo ""
   info "To connect this node to your Gylam Panel, you need:"
@@ -435,7 +495,7 @@ UNIT
 }
 
 # ====================================================================
-# UPDATE PANEL  — git pull, npm install, npm build, restart
+# UPDATE PANEL
 # ====================================================================
 update_panel() {
   log "=== Updating Gylam Panel ==="
@@ -443,26 +503,27 @@ update_panel() {
     err "Panel not found at ${PANEL_DIR}. Run 'install-panel' first."
     exit 1
   fi
+  ensure_node_and_npm
+
   log "Pulling latest code..."
   git -C "${PANEL_DIR}" fetch --all
   git -C "${PANEL_DIR}" pull --ff-only
+
   log "Installing dependencies..."
   if [[ -f "${PANEL_DIR}/package-lock.json" ]]; then
     npm --prefix "${PANEL_DIR}" ci --no-audit --no-fund
   else
     npm --prefix "${PANEL_DIR}" install --no-audit --no-fund
   fi
-  log "Rebuilding..."
-  npm --prefix "${PANEL_DIR}" run build
-  log "Restarting services..."
+
+  log "Restarting services (npm run dev)..."
   systemctl restart gylam-api 2>/dev/null || warn "gylam-api not running"
-  systemctl restart gylam-panel 2>/dev/null || warn "gylam-panel not running"
+  systemctl restart gylam-panel-dev 2>/dev/null || warn "gylam-panel-dev not running"
   log "Panel updated and restarted."
 }
 
 # ====================================================================
-# CREATE ADMIN  — writes directly to users.json with is_admin: true
-# This bypasses Supabase entirely, using file-based JSON auth.
+# CREATE ADMIN
 # ====================================================================
 create_admin() {
   log "=== Create Admin Account ==="
@@ -473,7 +534,6 @@ create_admin() {
 
   local users_file="${PANEL_DIR}/data/users.json"
   if [[ ! -f "${users_file}" ]]; then
-    # fallback to local file if running from source
     users_file="$(dirname "$(readlink -f "$0")")/data/users.json"
   fi
   if [[ ! -f "${users_file}" ]]; then
@@ -494,50 +554,33 @@ create_admin() {
   echo ""
   log "Creating admin account in users.json..."
 
-  # Use Node.js to safely generate the bcrypt hash and write JSON
   node -e "
 const fs = require('fs');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
-
 const usersFile = '${users_file}';
-const username = '${ADMIN_USER}';
-const email = '${ADMIN_EMAIL}';
-const password = '${admin_pass}';
-
 let data;
-try {
-  data = JSON.parse(fs.readFileSync(usersFile, 'utf-8'));
-} catch {
-  data = { users: [] };
-}
+try { data = JSON.parse(fs.readFileSync(usersFile, 'utf-8')); } catch { data = { users: [] }; }
 if (!data.users) data.users = [];
-
-// Check if user already exists
-const existing = data.users.find(u => u.email.toLowerCase() === email.toLowerCase());
+const existing = data.users.find(u => u.email.toLowerCase() === '${ADMIN_EMAIL}'.toLowerCase());
 if (existing) {
   existing.is_admin = true;
-  existing.password_hash = bcrypt.hashSync(password, 10);
+  existing.password_hash = bcrypt.hashSync('${admin_pass}', 10);
   fs.writeFileSync(usersFile, JSON.stringify(data, null, 2));
   console.log('[gylam] Existing user promoted to admin.');
   process.exit(0);
 }
-
-const user = {
+data.users.push({
   id: crypto.randomUUID(),
-  username: username,
-  email: email.toLowerCase(),
-  password_hash: bcrypt.hashSync(password, 10),
+  username: '${ADMIN_USER}',
+  email: '${ADMIN_EMAIL}'.toLowerCase(),
+  password_hash: bcrypt.hashSync('${admin_pass}', 10),
   is_admin: true,
   created_at: new Date().toISOString()
-};
-
-data.users.push(user);
+});
 fs.writeFileSync(usersFile, JSON.stringify(data, null, 2));
 console.log('[gylam] Admin account created successfully.');
-" --deps-dir "${PANEL_DIR}/node_modules" 2>&1 || {
-    # If bcryptjs isn't available, try with the panel's node_modules
-    warn "Trying with panel node_modules..."
+" 2>&1 || {
     if [[ -d "${PANEL_DIR}/node_modules" ]]; then
       NODE_PATH="${PANEL_DIR}/node_modules" node -e "
 const fs = require('fs');
