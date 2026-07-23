@@ -9,6 +9,7 @@
 #   bash install.sh install-node         # connect this VPS as a compute node
 #   bash install.sh update-panel         # pull latest and rebuild
 #   bash install.sh create-admin         # create the first admin account
+#   bash install.sh delete-panel         # completely remove the panel + node
 #
 set -euo pipefail
 
@@ -22,7 +23,7 @@ RESET="\033[0m"
 
 PANEL_DIR="${PANEL_DIR:-/opt/gylam-panel}"
 NODE_DIR="${NODE_DIR:-/opt/gylam-node}"
-REPO_URL="${REPO_URL:-https://github.com/RIVEOG/GYLAM.git}"
+REPO_URL="${REPO_URL:-https://github.com/your-org/gylam-panel.git}"
 
 log()  { echo -e "${GREEN}[gylam]${RESET} $1"; }
 warn() { echo -e "${YELLOW}[gylam]${RESET} $1"; }
@@ -163,19 +164,13 @@ show_menu() {
   echo -e "  ${BOLD}2)${RESET} Install Node      — connect this VPS as a compute node"
   echo -e "  ${BOLD}3)${RESET} Update Panel      — pull latest and rebuild"
   echo -e "  ${BOLD}4)${RESET} Create Admin      — create the first admin account"
+  echo -e "  ${BOLD}5)${RESET} ${RED}Delete Panel${RESET}     — ${RED}completely remove the panel + node${RESET}"
   echo -e "  ${BOLD}0)${RESET} Exit"
   echo ""
 }
 
 # ====================================================================
 # INSTALL PANEL
-# 1. Install dependencies (curl, git, ca-certificates)
-# 2. Check for npm — if missing, install Node.js 20 LTS (bundles npm)
-# 3. Clone the repo
-# 4. npm install
-# 5. npm run dev  (starts the panel in dev mode on port 8080)
-# 6. Configure .env
-# 7. Set up systemd services
 # ====================================================================
 install_panel() {
   log "=== Installing Gylam Panel ==="
@@ -241,7 +236,6 @@ ENVMIN
   # ── Start the API server (background) ──
   log "Starting API server on port 3001..."
   cd "${PANEL_DIR}"
-  # Kill any existing API process on port 3001
   if command -v fuser >/dev/null 2>&1; then
     fuser -k 3001/tcp 2>/dev/null || true
   fi
@@ -255,10 +249,8 @@ ENVMIN
   log "The panel will be available on port 8080."
   echo ""
 
-  # Install systemd services so it survives reboots
   install_panel_service
 
-  # Start via systemd if available, otherwise run npm run dev directly
   if systemctl is-system-running >/dev/null 2>&1; then
     log "Starting services via systemd..."
     systemctl daemon-reload
@@ -307,7 +299,6 @@ configure_env() {
 install_panel_service() {
   log "Installing systemd services..."
 
-  # API server (backend on port 3001)
   cat > /etc/systemd/system/gylam-api.service <<UNIT
 [Unit]
 Description=Gylam Panel API Server
@@ -326,7 +317,6 @@ Environment=NODE_ENV=production
 WantedBy=multi-user.target
 UNIT
 
-  # Web frontend — uses npm run dev (Vite dev server on port 8080)
   cat > /etc/systemd/system/gylam-panel-dev.service <<UNIT
 [Unit]
 Description=Gylam Panel Web Frontend (dev mode)
@@ -348,7 +338,7 @@ UNIT
 }
 
 # ====================================================================
-# INSTALL NODE  — node agent that heartbeats to the panel
+# INSTALL NODE
 # ====================================================================
 install_node() {
   log "=== Installing Gylam Node Agent ==="
@@ -628,6 +618,120 @@ console.log('[gylam] Admin account created successfully.');
 }
 
 # ====================================================================
+# DELETE PANEL  — completely remove everything
+# 1. Stop + disable systemd services (panel + API + node)
+# 2. Remove service unit files
+# 3. Kill any lingering processes
+# 4. Remove panel + node directories
+# 5. Remove log files
+# ====================================================================
+delete_panel() {
+  echo ""
+  err "============================================"
+  err "  WARNING: THIS WILL DELETE EVERYTHING!"
+  err "============================================"
+  echo ""
+  echo -e "  This will permanently remove:"
+  echo -e "   • The panel web frontend + API server"
+  echo -e "   • All user accounts and data"
+  echo -e "   • The node agent (if installed)"
+  echo -e "   • All systemd services"
+  echo -e "   • All log files"
+  echo ""
+  echo -e "  ${BOLD}Directories to be deleted:${RESET}"
+  echo -e "   ${RED}${PANEL_DIR}${RESET}"
+  echo -e "   ${RED}${NODE_DIR}${RESET}"
+  echo ""
+  echo -e "  ${BOLD}This action CANNOT be undone.${RESET}"
+  echo ""
+
+  prompt CONFIRM_DELETE "Type 'yes' to confirm deletion" ""
+  if [[ "${CONFIRM_DELETE}" != "yes" ]]; then
+    warn "Deletion cancelled — nothing was removed."
+    exit 0
+  fi
+
+  echo ""
+  prompt CONFIRM2 "Are you absolutely sure? Type 'DELETE' to proceed" ""
+  if [[ "${CONFIRM2}" != "DELETE" ]]; then
+    warn "Deletion cancelled — nothing was removed."
+    exit 0
+  fi
+
+  echo ""
+  log "=== Deleting Gylam Panel ==="
+
+  # ── Step 1: Stop + disable systemd services ──
+  log "Stopping systemd services..."
+  for svc in gylam-panel-dev gylam-api gylam-node; do
+    if systemctl list-unit-files 2>/dev/null | grep -q "${svc}"; then
+      systemctl stop "${svc}" 2>/dev/null || true
+      systemctl disable "${svc}" 2>/dev/null || true
+      log "Stopped + disabled ${svc}"
+    fi
+  done
+
+  # ── Step 2: Remove service unit files ──
+  log "Removing systemd unit files..."
+  for unit in \
+    /etc/systemd/system/gylam-api.service \
+    /etc/systemd/system/gylam-panel-dev.service \
+    /etc/systemd/system/gylam-node.service; do
+    if [[ -f "${unit}" ]]; then
+      rm -f "${unit}"
+      log "Removed ${unit}"
+    fi
+  done
+  systemctl daemon-reload 2>/dev/null || true
+
+  # ── Step 3: Kill any lingering processes ──
+  log "Killing any lingering Gylam processes..."
+  pkill -f "gylam" 2>/dev/null || true
+  pkill -f "server/index.js" 2>/dev/null || true
+  pkill -f "gylam-node/agent.mjs" 2>/dev/null || true
+  if command -v fuser >/dev/null 2>&1; then
+    fuser -k 3001/tcp 2>/dev/null || true
+    fuser -k 8080/tcp 2>/dev/null || true
+  fi
+
+  # ── Step 4: Remove directories ──
+  log "Removing panel directory..."
+  if [[ -d "${PANEL_DIR}" ]]; then
+    rm -rf "${PANEL_DIR}"
+    log "Removed ${PANEL_DIR}"
+  else
+    warn "Panel directory not found at ${PANEL_DIR}"
+  fi
+
+  log "Removing node directory..."
+  if [[ -d "${NODE_DIR}" ]]; then
+    rm -rf "${NODE_DIR}"
+    log "Removed ${NODE_DIR}"
+  else
+    warn "Node directory not found at ${NODE_DIR}"
+  fi
+
+  # ── Step 5: Remove log files ──
+  log "Removing log files..."
+  rm -f /var/log/gylam-api.log 2>/dev/null && log "Removed /var/log/gylam-api.log" || true
+  rm -f /var/log/gylam-panel.log 2>/dev/null || true
+  rm -f /var/log/gylam-node.log 2>/dev/null || true
+
+  echo ""
+  log "=== Gylam Panel has been completely deleted ==="
+  echo ""
+  echo -e "  ${BOLD}Removed:${RESET}"
+  echo -e "   • Panel directory:  ${PANEL_DIR}"
+  echo -e "   • Node directory:   ${NODE_DIR}"
+  echo -e "   • systemd services: gylam-api, gylam-panel-dev, gylam-node"
+  echo -e "   • Log files:        /var/log/gylam-*.log"
+  echo ""
+  echo -e "  ${BOLD}Note:${RESET} Node.js and npm were ${BOLD}not${RESET} removed."
+  echo -e "  To remove them too:  ${CYAN}apt-get purge -y nodejs && apt-get autoremove -y${RESET}"
+  echo ""
+}
+
+# ====================================================================
 # MAIN
 # ====================================================================
 main() {
@@ -642,6 +746,7 @@ main() {
       install-node)  install_node ;;
       update-panel)  update_panel ;;
       create-admin)  create_admin ;;
+      delete-panel)  delete_panel ;;
       *) err "Unknown command: $cmd"; show_menu; exit 1 ;;
     esac
     exit 0
@@ -649,12 +754,13 @@ main() {
 
   while true; do
     show_menu
-    read -rp "$(echo -e "${CYAN}Choose an option [0-4]: ${RESET}")" choice
+    read -rp "$(echo -e "${CYAN}Choose an option [0-5]: ${RESET}")" choice
     case "$choice" in
       1) install_panel; break ;;
       2) install_node; break ;;
       3) update_panel; break ;;
       4) create_admin; break ;;
+      5) delete_panel; break ;;
       0) echo "Bye."; exit 0 ;;
       *) warn "Invalid option." ;;
     esac
