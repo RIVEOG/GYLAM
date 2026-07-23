@@ -1,1 +1,12 @@
-{"users":[]}
+{
+  "users": [
+    {
+      "id": "6fe56d3a-17f6-49ff-a5dc-e7c318e76055",
+      "username": "ruvv",
+      "email": "ruvv@ruvv.com",
+      "password_hash": "$2a$10$6zxWXOyi.Pa3qpLoRnOcrOiPXuQhXxr53k9.IQNu1PyYxdwpBYtei",
+      "is_admin": true,
+      "created_at": "2026-07-23T14:22:42.216Z"
+    }
+  ]
+}

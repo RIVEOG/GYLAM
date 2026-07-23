@@ -7,8 +7,6 @@ const path = require('path');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'gylam-panel-secret-change-me';
 
-// ── Data directory: use the project root /data folder ──
-// This works whether Vite runs from the project root or /opt/gylam-panel
 const DATA_DIR = path.resolve(process.cwd(), 'data');
 const USERS_FILE = path.join(DATA_DIR, 'users.json');
 const NODES_FILE = path.join(DATA_DIR, 'nodes.json');
@@ -60,7 +58,6 @@ function createApiServer() {
 
   app.get('/api/health', (_req, res) => res.json({ status: 'ok', panel: 'Gylam Panel', made: 'Nethost Team' }));
 
-  // ── Auth ──
   app.post('/api/auth/register', async (req, res) => {
     const { username, email, password } = req.body;
     if (!username || !email || !password) return res.status(400).json({ error: 'Missing fields' });
@@ -90,13 +87,11 @@ function createApiServer() {
     res.json({ user: safeUser(user) });
   });
 
-  // ── Admin bootstrap: create first admin via secret ──
   app.post('/api/admin/create', async (req, res) => {
     const { username, email, password, secret } = req.body;
     const bootstrapSecret = process.env.ADMIN_BOOTSTRAP_SECRET || 'gylam-bootstrap';
     const users = readUsers();
 
-    // Either the bootstrap secret is correct, or an existing admin is logged in
     if (secret !== bootstrapSecret) {
       const header = req.headers.authorization;
       if (!header) return res.status(403).json({ error: 'Unauthorized' });
@@ -114,7 +109,6 @@ function createApiServer() {
     res.json({ user: safeUser(user), message: 'Admin created' });
   });
 
-  // ── Admin user management ──
   app.get('/api/admin/users', auth, adminOnly, (_req, res) => res.json({ users: readUsers().map(safeUser) }));
   app.delete('/api/admin/users/:id', auth, adminOnly, (req, res) => { writeUsers(readUsers().filter((u) => u.id !== req.params.id)); res.json({ success: true }); });
   app.patch('/api/admin/users/:id', auth, adminOnly, (req, res) => {
@@ -127,7 +121,6 @@ function createApiServer() {
     res.json({ user: safeUser(users[idx]) });
   });
 
-  // ── Nodes ──
   app.get('/api/nodes', auth, (_req, res) => res.json({ nodes: readNodes() }));
   app.post('/api/nodes', auth, adminOnly, (req, res) => {
     const nodes = readNodes();

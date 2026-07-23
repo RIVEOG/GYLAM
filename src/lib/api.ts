@@ -1,6 +1,4 @@
-/// <reference types="vite/client" />
-
-interface SafeUser {
+export interface SafeUser {
   id: string;
   username: string;
   email: string;
@@ -58,5 +56,3 @@ export const api = {
     request<{ node: PanelNode }>('/nodes', { method: 'POST', body: JSON.stringify(body) }),
   deleteNode: (id: string) => request<{ success: boolean }>(`/nodes/${id}`, { method: 'DELETE' }),
 };
-
-export type { SafeUser };

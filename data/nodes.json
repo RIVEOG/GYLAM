@@ -1,1 +1,15 @@
-{"nodes":[]}
+{
+  "nodes": [
+    {
+      "id": "f60a3023-1289-469e-8bb0-c8aae16885c4",
+      "name": "11",
+      "ip_assigned": "11.11.111",
+      "status": "offline",
+      "location": "new york",
+      "ram_total_mb": 4096,
+      "disk_total_mb": 20480,
+      "cpu_total_percent": 200,
+      "created_at": "2026-07-23T14:23:38.347Z"
+    }
+  ]
+}

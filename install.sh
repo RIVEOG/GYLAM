@@ -23,8 +23,14 @@ RESET="\033[0m"
 PANEL_DIR="${PANEL_DIR:-/opt/gylam-panel}"
 NODE_DIR="${NODE_DIR:-/opt/gylam-node}"
 
-# Directory this script lives in — the panel source files sit next to it.
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ── Resolve the directory containing the panel source files ────────
+# When piped via `curl | bash`, BASH_SOURCE resolves to /proc/self/fd
+# or /dev/fd — not a real directory. Fall back to $PWD in that case.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+if [[ "${SCRIPT_DIR}" == /proc/* || "${SCRIPT_DIR}" == /dev/fd* || ! -d "${SCRIPT_DIR}" ]]; then
+  SCRIPT_DIR="$(pwd)"
+fi
+export SCRIPT_DIR
 
 log()  { echo -e "${GREEN}[gylam]${RESET} $1"; }
 warn() { echo -e "${YELLOW}[gylam]${RESET} $1"; }
@@ -62,17 +68,40 @@ prompt() {
   printf -v "$var_name" '%s' "$value"
 }
 
-# ── Copy panel source from the directory this script lives in ──────
+# ── Find the panel source directory ────────────────────────────────
+# Checks SCRIPT_DIR first (files next to install.sh), then PWD.
+# This handles both `bash install.sh` and `curl | bash` invocations.
+find_source_dir() {
+  local dir="${SCRIPT_DIR}"
+
+  if [[ -f "${dir}/package.json" ]] && [[ -d "${dir}/server" ]]; then
+    echo "${dir}"
+    return 0
+  fi
+
+  dir="$(pwd)"
+  if [[ -f "${dir}/package.json" ]] && [[ -d "${dir}/server" ]]; then
+    echo "${dir}"
+    return 0
+  fi
+
+  return 1
+}
+
+# ── Copy panel source ──────────────────────────────────────────────
 copy_panel_source() {
   local dest="$1"
-  local src="${SCRIPT_DIR}"
-
-  if [[ ! -f "${src}/package.json" ]] || [[ ! -d "${src}/server" ]]; then
-    err "Panel source files not found next to install.sh (${src})."
+  local src
+  src="$(find_source_dir)" || {
+    err "Panel source files not found."
+    err "Looked in: ${SCRIPT_DIR} and $(pwd)"
+    err ""
     err "Please place the panel files (package.json, server/, src/, etc.)"
     err "in the same folder as install.sh and re-run."
+    err ""
+    err "Or run install.sh from the directory containing the panel files."
     exit 1
-  fi
+  }
 
   log "Copying panel files from ${src} to ${dest}..."
   mkdir -p "$(dirname "${dest}")"
@@ -364,7 +393,9 @@ create_admin() {
 
   local users_file="${PANEL_DIR}/data/users.json"
   if [[ ! -f "${users_file}" ]]; then
-    users_file="${SCRIPT_DIR}/data/users.json"
+    local src_dir
+    src_dir="$(find_source_dir 2>/dev/null || echo "${SCRIPT_DIR}")"
+    users_file="${src_dir}/data/users.json"
   fi
   if [[ ! -f "${users_file}" ]]; then
     users_file="./data/users.json"
