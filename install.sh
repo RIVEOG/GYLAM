@@ -5,7 +5,7 @@
 #
 # Usage:
 #   bash install.sh                      # interactive menu
-#   bash install.sh install-panel        # install the web panel
+#   bash install.sh install-panel        # install the web panel on this VPS
 #   bash install.sh install-node         # connect this VPS as a compute node
 #   bash install.sh update-panel         # pull latest and rebuild
 #   bash install.sh create-admin         # create the first admin account
@@ -63,17 +63,16 @@ prompt() {
 # ── Fix dpkg cross-device link errors ──────────────────────────────
 # On some VPS/container setups dpkg cannot create backup hard-links
 # across filesystem boundaries ("Invalid cross-device link"). This
-# function repairs any interrupted dpkg state and pre-empts the error.
+# repairs any interrupted dpkg state and pre-empts the error.
 fix_dpkg() {
   export DEBIAN_FRONTEND=noninteractive
-  # Repair any half-installed packages from a previous failed run
   dpkg --configure -a 2>/dev/null || true
   apt-get install -y --fix-broken 2>/dev/null || true
 }
 
-# ── Install a single apt package only if the command is missing ────
-# This avoids the cross-device link error entirely for packages that
-# are already installed (dpkg only fails on UPGRADES in that scenario).
+# ── Install a single package only if the command is missing ────────
+# This avoids the cross-device link error for packages already present
+# (dpkg only fails on UPGRADES in that scenario).
 ensure_pkg() {
   local cmd="$1" pkg="$2"
   if command -v "$cmd" >/dev/null 2>&1; then
@@ -88,8 +87,7 @@ ensure_pkg() {
       -o Dpkg::Options::="--force-confold" \
       "$pkg" 2>/dev/null || {
       warn "Standard install failed, retrying with --force-all..."
-      apt-get install -y --no-install-recommends \
-        -o Dpkg::Options::="--force-all" "$pkg"
+      apt-get install -y -o Dpkg::Options::="--force-all" "$pkg"
     }
   elif command -v dnf >/dev/null 2>&1; then
     dnf install -y -q "$pkg"
@@ -148,7 +146,7 @@ show_menu() {
 }
 
 # ====================================================================
-# INSTALL PANEL  — clone files, npm install, npm build, systemd
+# INSTALL PANEL  — clone, npm install, npm build, systemd
 # ====================================================================
 install_panel() {
   log "=== Installing Gylam Panel ==="
@@ -156,7 +154,7 @@ install_panel() {
   install_deps
   install_nodejs
 
-  # ── Clone or update the repo ──
+  # ── Clone or update ──
   if [[ -d "${PANEL_DIR}/.git" ]]; then
     log "Repository exists at ${PANEL_DIR}, pulling latest..."
     git -C "${PANEL_DIR}" fetch --all
@@ -184,16 +182,13 @@ install_panel() {
     if [[ -f "${PANEL_DIR}/.env.example" ]]; then
       cp "${PANEL_DIR}/.env.example" "${env_file}"
     else
-      # repo may not ship .env.example — create a minimal one
       cat > "${env_file}" <<ENVMIN
 VITE_SUPABASE_URL=
 VITE_SUPABASE_ANON_KEY=
-SUPABASE_URL=
-SUPABASE_ANON_KEY=
-SUPABASE_SERVICE_ROLE_KEY=
-VITE_ADMIN_EMAIL=admin@gylam.panel
-VITE_ADMIN_PASSWORD=changeme123
-VITE_ADMIN_USERNAME=admin
+VITE_PANEL_NAME=Gylam Panel
+API_PORT=3001
+JWT_SECRET=change-this-secret
+ADMIN_BOOTSTRAP_SECRET=gylam-bootstrap
 ENVMIN
     fi
     echo ""
@@ -206,11 +201,18 @@ ENVMIN
     fi
   fi
 
+  # ── Ensure data directory + users.json exist ──
+  mkdir -p "${PANEL_DIR}/data"
+  if [[ ! -f "${PANEL_DIR}/data/users.json" ]]; then
+    echo '{"users":[]}' > "${PANEL_DIR}/data/users.json"
+    log "Created data/users.json"
+  fi
+
   # ── npm build ──
   log "Building production bundle..."
   npm --prefix "${PANEL_DIR}" run build
 
-  # ── systemd service ──
+  # ── systemd services (API + web) ──
   install_panel_service
 
   echo ""
@@ -219,8 +221,8 @@ ENVMIN
   local server_ip
   server_ip="$(hostname -I 2>/dev/null | awk '{print $1}' || echo 'server-ip')"
   echo -e "  ${BOLD}Next steps:${RESET}"
-  echo -e "   1. Edit  ${CYAN}${env_file}${RESET}  with your Supabase + admin config"
-  echo -e "   2. Start:  ${CYAN}systemctl start gylam-panel${RESET}"
+  echo -e "   1. Edit  ${CYAN}${env_file}${RESET}  with your config"
+  echo -e "   2. Start:  ${CYAN}systemctl start gylam-panel gylam-api${RESET}"
   echo -e "   3. Open:   ${CYAN}http://${server_ip}:8080${RESET}"
   echo -e "   4. Create your admin:  ${CYAN}bash install.sh create-admin${RESET}"
   echo ""
@@ -229,49 +231,48 @@ ENVMIN
 configure_env() {
   local env_file="$1"
   echo ""
-  info "Enter your Supabase credentials (from your Supabase project settings):"
-  prompt SUP_URL "Supabase URL"
-  prompt SUP_ANON "Supabase Anon Key"
-  prompt SUP_SERVICE "Supabase Service Role Key"
-
-  echo ""
-  info "Enter the first admin account:"
-  prompt ADMIN_EMAIL "Admin Email" "admin@gylam.panel"
-  prompt ADMIN_USER "Admin Username" "admin"
-
-  local admin_pass
-  while true; do
-    read -rsp "$(echo -e "${CYAN}Admin Password (min 8 chars): ${RESET}")" admin_pass
-    echo ""
-    if [[ ${#admin_pass} -ge 8 ]]; then break; fi
-    warn "Password must be at least 8 characters."
-  done
+  prompt JWT_SECRET_INPUT "JWT Secret (for session tokens)" "gylam-$(head -c 8 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9')"
+  prompt API_PORT_INPUT "API Port" "3001"
 
   sed -i \
-    -e "s|^VITE_SUPABASE_URL=.*|VITE_SUPABASE_URL=${SUP_URL}|" \
-    -e "s|^VITE_SUPABASE_ANON_KEY=.*|VITE_SUPABASE_ANON_KEY=${SUP_ANON}|" \
-    -e "s|^SUPABASE_URL=.*|SUPABASE_URL=${SUP_URL}|" \
-    -e "s|^SUPABASE_ANON_KEY=.*|SUPABASE_ANON_KEY=${SUP_ANON}|" \
-    -e "s|^SUPABASE_SERVICE_ROLE_KEY=.*|SUPABASE_SERVICE_ROLE_KEY=${SUP_SERVICE}|" \
-    -e "s|^VITE_ADMIN_EMAIL=.*|VITE_ADMIN_EMAIL=${ADMIN_EMAIL}|" \
-    -e "s|^VITE_ADMIN_PASSWORD=.*|VITE_ADMIN_PASSWORD=${admin_pass}|" \
-    -e "s|^VITE_ADMIN_USERNAME=.*|VITE_ADMIN_USERNAME=${ADMIN_USER}|" \
+    -e "s|^JWT_SECRET=.*|JWT_SECRET=${JWT_SECRET_INPUT}|" \
+    -e "s|^API_PORT=.*|API_PORT=${API_PORT_INPUT}|" \
+    -e "s|^VITE_API_BASE=.*|VITE_API_BASE=http://$(hostname -I 2>/dev/null | awk '{print $1}'):${API_PORT_INPUT}/api|" \
     "${env_file}"
   log ".env configured."
 }
 
 install_panel_service() {
-  local svc="/etc/systemd/system/gylam-panel.service"
-  log "Installing systemd service..."
-  cat > "${svc}" <<UNIT
+  log "Installing systemd services..."
+
+  # API server
+  cat > /etc/systemd/system/gylam-api.service <<UNIT
 [Unit]
-Description=Gylam Panel — Game Server Management
+Description=Gylam Panel API Server
 After=network.target
 
 [Service]
 Type=simple
 WorkingDirectory=${PANEL_DIR}
 EnvironmentFile=${PANEL_DIR}/.env
+ExecStart=$(command -v node) server/index.js
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+  # Web frontend (vite preview)
+  cat > /etc/systemd/system/gylam-panel.service <<UNIT
+[Unit]
+Description=Gylam Panel Web Frontend
+After=network.target gylam-api.service
+
+[Service]
+Type=simple
+WorkingDirectory=${PANEL_DIR}
 ExecStart=$(command -v npx) vite preview --host 0.0.0.0 --port 8080
 Restart=on-failure
 RestartSec=5
@@ -280,9 +281,10 @@ Environment=NODE_ENV=production
 [Install]
 WantedBy=multi-user.target
 UNIT
+
   systemctl daemon-reload
-  systemctl enable gylam-panel 2>/dev/null || true
-  warn "Service installed. Start with: systemctl start gylam-panel"
+  systemctl enable gylam-api gylam-panel 2>/dev/null || true
+  warn "Services installed. Start with: systemctl start gylam-api gylam-panel"
 }
 
 # ====================================================================
@@ -296,15 +298,12 @@ install_node() {
 
   echo ""
   info "To connect this node to your Gylam Panel, you need:"
-  info "  • The Node ID    (shown in Admin > Nodes > Connect)"
-  info "  • The Node Token (generated in the same place)"
-  info "  • Your Supabase URL and Anon Key"
+  info "  • The Node ID (shown in Admin > Nodes > Connect)"
+  info "  • Your panel API URL"
   echo ""
 
   prompt NODE_ID "Node ID (from panel)"
-  prompt NODE_TOKEN "Node Token (from panel)"
-  prompt SUP_URL_NODE "Supabase URL"
-  prompt SUP_ANON_NODE "Supabase Anon Key"
+  prompt PANEL_API "Panel API URL" "http://$(hostname -I 2>/dev/null | awk '{print $1}'):3001"
   prompt NODE_NAME "Node display name" "node-$(hostname)"
 
   local node_ip
@@ -318,9 +317,7 @@ install_node() {
 
   cat > "${NODE_DIR}/.env" <<ENVEOF
 NODE_ID=${NODE_ID}
-NODE_TOKEN=${NODE_TOKEN}
-SUPABASE_URL=${SUP_URL_NODE}
-SUPABASE_ANON_KEY=${SUP_ANON_NODE}
+PANEL_API=${PANEL_API}
 NODE_NAME=${NODE_NAME}
 NODE_IP=${NODE_IP}
 HEARTBEAT_INTERVAL=30
@@ -340,7 +337,6 @@ ENVEOF
   echo -e "  ${BOLD}Status:${RESET}"
   echo -e "   • Check logs:    ${CYAN}journalctl -u gylam-node -f${RESET}"
   echo -e "   • Restart:       ${CYAN}systemctl restart gylam-node${RESET}"
-  echo -e "   • The panel should now show this node as ${GREEN}online${RESET}"
   echo ""
 }
 
@@ -365,50 +361,39 @@ function loadEnv() {
 }
 
 const env = loadEnv();
-const SUPABASE_URL = env.SUPABASE_URL;
-const SUPABASE_ANON_KEY = env.SUPABASE_ANON_KEY;
-const NODE_TOKEN = env.NODE_TOKEN;
+const PANEL_API = env.PANEL_API;
+const NODE_ID = env.NODE_ID;
 const HEARTBEAT_INTERVAL = parseInt(env.HEARTBEAT_INTERVAL || '30', 10) * 1000;
 
-if (!SUPABASE_URL || !SUPABASE_ANON_KEY || !NODE_TOKEN) {
-  console.error('[gylam-node] Missing SUPABASE_URL, SUPABASE_ANON_KEY, or NODE_TOKEN in .env');
+if (!PANEL_API || !NODE_ID) {
+  console.error('[gylam-node] Missing PANEL_API or NODE_ID in .env');
   process.exit(1);
 }
 
-console.log(`[gylam-node] Agent started. Heartbeat every ${HEARTBEAT_INTERVAL / 1000}s`);
+console.log(`[gylam-node] Agent started. Heartbeat every ${HEARTBEAT_INTERVAL / 1000}s to ${PANEL_API}`);
 
 async function heartbeat(status) {
-  const url = `${SUPABASE_URL}/rest/v1/rpc/node_heartbeat`;
   try {
-    const res = await fetch(url, {
+    const res = await fetch(`${PANEL_API}/api/nodes/${NODE_ID}/heartbeat`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        apikey: SUPABASE_ANON_KEY,
-        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-      },
-      body: JSON.stringify({ p_token: NODE_TOKEN, p_status: status }),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ status }),
     });
     if (!res.ok) {
       console.error(`[gylam-node] Heartbeat failed: HTTP ${res.status}`);
-      return null;
+      return false;
     }
-    const data = await res.json();
-    return data;
+    console.log(`[gylam-node] Heartbeat OK — ${status}`);
+    return true;
   } catch (err) {
     console.error(`[gylam-node] Heartbeat error: ${err.message}`);
-    return null;
+    return false;
   }
 }
 
 async function loop() {
   while (true) {
-    const id = await heartbeat('online');
-    if (id) {
-      console.log(`[gylam-node] Heartbeat OK (node ${id}) — online`);
-    } else {
-      console.error('[gylam-node] Heartbeat rejected — check NODE_TOKEN');
-    }
+    await heartbeat('online');
     await new Promise((r) => setTimeout(r, HEARTBEAT_INTERVAL));
   }
 }
@@ -430,9 +415,7 @@ AGENTEOF
 }
 
 install_node_service() {
-  local svc="/etc/systemd/system/gylam-node.service"
-  log "Installing systemd service for node agent..."
-  cat > "${svc}" <<UNIT
+  cat > /etc/systemd/system/gylam-node.service <<UNIT
 [Unit]
 Description=Gylam Node Agent
 After=network.target
@@ -471,37 +454,34 @@ update_panel() {
   fi
   log "Rebuilding..."
   npm --prefix "${PANEL_DIR}" run build
-  log "Restarting service..."
-  systemctl restart gylam-panel 2>/dev/null || warn "Service not running — start with: systemctl start gylam-panel"
+  log "Restarting services..."
+  systemctl restart gylam-api 2>/dev/null || warn "gylam-api not running"
+  systemctl restart gylam-panel 2>/dev/null || warn "gylam-panel not running"
   log "Panel updated and restarted."
 }
 
 # ====================================================================
-# CREATE ADMIN  — calls Supabase bootstrap_admin RPC
+# CREATE ADMIN  — writes directly to users.json with is_admin: true
+# This bypasses Supabase entirely, using file-based JSON auth.
 # ====================================================================
 create_admin() {
   log "=== Create Admin Account ==="
-
-  local sup_url sup_service
-  if [[ -f "${PANEL_DIR}/.env" ]]; then
-    sup_url="$(grep -m1 '^SUPABASE_URL=' "${PANEL_DIR}/.env" | cut -d= -f2- || true)"
-    sup_service="$(grep -m1 '^SUPABASE_SERVICE_ROLE_KEY=' "${PANEL_DIR}/.env" | cut -d= -f2- || true)"
-  fi
-
-  if [[ -z "${sup_url}" ]]; then
-    prompt sup_url "Supabase URL"
-  else
-    info "Using SUPABASE_URL from .env"
-  fi
-  if [[ -z "${sup_service}" ]]; then
-    prompt sup_service "Supabase Service Role Key"
-  else
-    info "Using SUPABASE_SERVICE_ROLE_KEY from .env"
-  fi
-
   echo ""
-  prompt ADMIN_EMAIL "Admin Email" "admin@gylam.panel"
+  info "This creates an admin account stored in users.json (file-based auth)."
+  info "No Supabase required — the admin is saved with is_admin: true."
+  echo ""
+
+  local users_file="${PANEL_DIR}/data/users.json"
+  if [[ ! -f "${users_file}" ]]; then
+    # fallback to local file if running from source
+    users_file="$(dirname "$(readlink -f "$0")")/data/users.json"
+  fi
+  if [[ ! -f "${users_file}" ]]; then
+    users_file="./data/users.json"
+  fi
+
   prompt ADMIN_USER "Admin Username" "admin"
+  prompt ADMIN_EMAIL "Admin Email" "admin@gylam.panel"
 
   local admin_pass
   while true; do
@@ -512,35 +492,96 @@ create_admin() {
   done
 
   echo ""
-  log "Creating admin account via Supabase..."
-  local response http_code body
-  response=$(curl -s -w "\n%{http_code}" \
-    -X POST "${sup_url}/rest/v1/rpc/bootstrap_admin" \
-    -H "Content-Type: application/json" \
-    -H "apikey: ${sup_service}" \
-    -H "Authorization: Bearer ${sup_service}" \
-    -d "{\"p_email\": \"${ADMIN_EMAIL}\", \"p_password\": \"${admin_pass}\", \"p_username\": \"${ADMIN_USER}\"}")
+  log "Creating admin account in users.json..."
 
-  http_code="$(echo "$response" | tail -1)"
-  body="$(echo "$response" | sed '$d')"
+  # Use Node.js to safely generate the bcrypt hash and write JSON
+  node -e "
+const fs = require('fs');
+const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 
-  if [[ "${http_code}" == "200" ]] && [[ "$body" != "null" ]]; then
-    log "Admin account created successfully!"
-    echo ""
-    echo -e "  ${BOLD}Admin credentials:${RESET}"
-    echo -e "   Email:    ${CYAN}${ADMIN_EMAIL}${RESET}"
-    echo -e "   Username: ${CYAN}${ADMIN_USER}${RESET}"
-    echo -e "   You can now sign in at the panel."
-    echo ""
-    warn "Add these to your .env for persistence:"
-    echo -e "   VITE_ADMIN_EMAIL=${ADMIN_EMAIL}"
-    echo -e "   VITE_ADMIN_USERNAME=${ADMIN_USER}"
-  else
-    err "Failed to create admin (HTTP ${http_code})."
-    err "Response: ${body}"
-    err "Check your Supabase URL and Service Role Key."
-    exit 1
-  fi
+const usersFile = '${users_file}';
+const username = '${ADMIN_USER}';
+const email = '${ADMIN_EMAIL}';
+const password = '${admin_pass}';
+
+let data;
+try {
+  data = JSON.parse(fs.readFileSync(usersFile, 'utf-8'));
+} catch {
+  data = { users: [] };
+}
+if (!data.users) data.users = [];
+
+// Check if user already exists
+const existing = data.users.find(u => u.email.toLowerCase() === email.toLowerCase());
+if (existing) {
+  existing.is_admin = true;
+  existing.password_hash = bcrypt.hashSync(password, 10);
+  fs.writeFileSync(usersFile, JSON.stringify(data, null, 2));
+  console.log('[gylam] Existing user promoted to admin.');
+  process.exit(0);
+}
+
+const user = {
+  id: crypto.randomUUID(),
+  username: username,
+  email: email.toLowerCase(),
+  password_hash: bcrypt.hashSync(password, 10),
+  is_admin: true,
+  created_at: new Date().toISOString()
+};
+
+data.users.push(user);
+fs.writeFileSync(usersFile, JSON.stringify(data, null, 2));
+console.log('[gylam] Admin account created successfully.');
+" --deps-dir "${PANEL_DIR}/node_modules" 2>&1 || {
+    # If bcryptjs isn't available, try with the panel's node_modules
+    warn "Trying with panel node_modules..."
+    if [[ -d "${PANEL_DIR}/node_modules" ]]; then
+      NODE_PATH="${PANEL_DIR}/node_modules" node -e "
+const fs = require('fs');
+const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
+const usersFile = '${users_file}';
+let data;
+try { data = JSON.parse(fs.readFileSync(usersFile, 'utf-8')); } catch { data = { users: [] }; }
+if (!data.users) data.users = [];
+const existing = data.users.find(u => u.email.toLowerCase() === '${ADMIN_EMAIL}'.toLowerCase());
+if (existing) {
+  existing.is_admin = true;
+  existing.password_hash = bcrypt.hashSync('${admin_pass}', 10);
+  fs.writeFileSync(usersFile, JSON.stringify(data, null, 2));
+  console.log('[gylam] Existing user promoted to admin.');
+  process.exit(0);
+}
+data.users.push({
+  id: crypto.randomUUID(),
+  username: '${ADMIN_USER}',
+  email: '${ADMIN_EMAIL}'.toLowerCase(),
+  password_hash: bcrypt.hashSync('${admin_pass}', 10),
+  is_admin: true,
+  created_at: new Date().toISOString()
+});
+fs.writeFileSync(usersFile, JSON.stringify(data, null, 2));
+console.log('[gylam] Admin account created successfully.');
+"
+    else
+      err "Could not find bcryptjs. Run 'npm install' in ${PANEL_DIR} first."
+      exit 1
+    fi
+  }
+
+  echo ""
+  echo -e "  ${BOLD}Admin account created:${RESET}"
+  echo -e "   Username: ${CYAN}${ADMIN_USER}${RESET}"
+  echo -e "   Email:    ${CYAN}${ADMIN_EMAIL}${RESET}"
+  echo -e "   File:     ${CYAN}${users_file}${RESET}"
+  echo -e "   is_admin: ${GREEN}true${RESET}"
+  echo ""
+  warn "Restart the API server to pick up the new account:"
+  echo -e "   systemctl restart gylam-api"
+  echo ""
 }
 
 # ====================================================================
